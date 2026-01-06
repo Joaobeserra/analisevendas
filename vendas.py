@@ -1,9 +1,113 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-from etl import carregar_base_vendas
+import re
+from pathlib import Path
 
 
+# ============================================================
+# ETL (embutido no mesmo arquivo)
+# ============================================================
+@st.cache_data
+def carregar_base_vendas(pasta_bases: Path) -> pd.DataFrame:
+    pasta = Path(pasta_bases)
+
+    # Checagens (para erro amigável no Cloud)
+    arq_produtos = pasta / "Cadastro Produtos.xlsx"
+    arq_localidades = pasta / "Cadastro Localidades.xlsx"
+    arq_lojas = pasta / "Cadastro Lojas.xlsx"
+    arq_clientes = pasta / "Cadastro Clientes.xlsx"
+
+    faltando = [p.name for p in [arq_produtos, arq_localidades, arq_lojas, arq_clientes] if not p.exists()]
+    if faltando:
+        st.error(
+            "Arquivos obrigatórios não encontrados na pasta de dados:\n"
+            + "\n".join([f"- {x}" for x in faltando])
+            + "\n\nDica: crie a pasta `data/` no repositório e suba esses arquivos nela."
+        )
+        return pd.DataFrame()
+
+    # Produtos
+    produtos = pd.read_excel(arq_produtos)
+
+    # Base Vendas (vários arquivos)
+    arquivos_vendas = sorted(pasta.glob("Base Vendas*.xlsx"))
+    dfs = []
+    for arq in arquivos_vendas:
+        df_v = pd.read_excel(arq)
+
+        m = re.search(r"(20\d{2})", arq.stem)
+        if m:
+            df_v["ano"] = int(m.group(1))
+
+        df_v["arquivo_origem"] = arq.name
+        dfs.append(df_v)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    base_vendas = pd.concat(dfs, ignore_index=True)
+
+    # Localidade / Lojas
+    localidade = pd.read_excel(arq_localidades)
+    lojas = pd.read_excel(arq_lojas)
+
+    lojas.columns = lojas.columns.str.strip()
+    localidade.columns = localidade.columns.str.strip()
+
+    cols_loc = ["ID Localidade", "País", "Continente"]
+    lojas = lojas.merge(
+        localidade[cols_loc],
+        how="left",
+        left_on="id Localidade",
+        right_on="ID Localidade",
+        validate="many_to_one"
+    ).drop(columns=["ID Localidade"], errors="ignore")
+
+    # Clientes (tratamento igual ao seu)
+    clientes = pd.read_excel(arq_clientes)
+    clientes = clientes.drop(index=0, errors="ignore").reset_index(drop=True)
+    clientes.columns = clientes.iloc[0]
+    clientes = clientes.iloc[1:].reset_index(drop=True)
+    clientes = clientes.iloc[:, :-2]
+
+    # Limpeza e junções
+    base_vendas = base_vendas.drop(columns=["arquivo_origem"], errors="ignore")
+
+    cols_prod = ["SKU", "Produto", "Marca", "Tipo do Produto", "Preço Unitario", "Custo Unitario"]
+    base_vendas = base_vendas.merge(produtos[cols_prod], on="SKU", how="left", validate="many_to_one")
+
+    cols_lojas = ["ID Loja", "Nome da Loja", "Quantidade Colaboradores", "Tipo", "País", "Continente"]
+    base_vendas = base_vendas.merge(lojas[cols_lojas], on="ID Loja", how="left", validate="many_to_one")
+
+    cols_cli = ["ID Cliente", "Genero", "Estado Civil"]
+    base_vendas = base_vendas.merge(clientes[cols_cli], on="ID Cliente", how="left", validate="many_to_one")
+
+    # Faturamento
+    if "Preço Unitario" in base_vendas.columns and "Qtd Vendida" in base_vendas.columns:
+        base_vendas["Preço Unitario"] = pd.to_numeric(base_vendas["Preço Unitario"], errors="coerce")
+        base_vendas["Qtd Vendida"] = pd.to_numeric(base_vendas["Qtd Vendida"], errors="coerce")
+        base_vendas["Faturamento"] = (base_vendas["Preço Unitario"].fillna(0) * base_vendas["Qtd Vendida"].fillna(0))
+
+    # Ajustes de categoria
+    if "Genero" in base_vendas.columns:
+        base_vendas["Genero"] = base_vendas["Genero"].replace({"M": "Masculino", "F": "Feminino"})
+
+    ordem = [
+        "Ordem de Compra", "SKU", "Marca", "Produto", "Tipo do Produto", "Qtd Vendida",
+        "Preço Unitario", "Custo Unitario", "Faturamento", "ID Loja", "Nome da Loja",
+        "Quantidade Colaboradores", "Tipo", "País", "Continente",
+        "ID Cliente", "Genero", "Estado Civil", "Data da Venda", "ano"
+    ]
+    cols_existentes = [c for c in ordem if c in base_vendas.columns]
+    base_vendas = base_vendas[cols_existentes]
+
+    return base_vendas
+
+
+# ============================================================
+# APP
+# ============================================================
 st.set_page_config(
     page_title="Página Vendas",
     layout="wide",
@@ -12,9 +116,13 @@ st.set_page_config(
 
 st.write("# Bem-vindo à Página Vendas")
 
+# Pasta padrão no repo (data/)
+ROOT = Path(__file__).resolve().parent  # [web:272]
+PASTA_BASES = ROOT / "data"
+if not PASTA_BASES.exists():
+    PASTA_BASES = ROOT / "Bases"
 
-pasta_bases = r"C:\Users\User\Desktop\Projetos\01. Pessoal\04. Vendas Hashtag Eletro\Bases"
-base_vendas = carregar_base_vendas(pasta_bases)
+base_vendas = carregar_base_vendas(PASTA_BASES)
 
 # Se a base vier vazia, evita erro e informa na tela
 if base_vendas.empty:
@@ -26,7 +134,7 @@ if base_vendas.empty:
 # ---------------------------
 with st.sidebar:
     st.header("Filtros")
-    periodo = st.selectbox("Período", ["Diário", "Mensal", "Anual"], index=1)  # [web:239]
+    periodo = st.selectbox("Período", ["Diário", "Mensal", "Anual"], index=1)
 
 # ---------------------------
 # Preparação dos dados
@@ -34,7 +142,6 @@ with st.sidebar:
 base_vendas["Data da Venda"] = pd.to_datetime(base_vendas["Data da Venda"], errors="coerce")
 df = base_vendas.dropna(subset=["Data da Venda", "Ordem de Compra"]).copy()
 
-# (Opcional) evita categorias vazias nos gráficos
 for c in ["Genero", "Estado Civil", "Marca", "Continente"]:
     if c in df.columns:
         df[c] = df[c].fillna("Não informado")
@@ -57,7 +164,7 @@ vendas_periodo = (
 )
 
 # ============================================================
-# Botão/Seletor de "Análise"
+# Seletor de "Análise"
 # ============================================================
 st.subheader("Análise")
 
@@ -65,19 +172,13 @@ analise = st.selectbox(
     "Escolha a análise",
     ["Venda", "Faturamento", "Média de receita por venda"],
     index=0,
-)  # [web:239]
+)
 
-# --- Descobre coluna de faturamento (ajuste se quiser fixar uma)
-possiveis_colunas_faturamento = [
-    "Faturamento", "Valor", "Valor Total", "Valor Venda", "Valor da Venda",
-    "Receita", "Receita Total", "Total", "Total Venda", "Preço", "Preco"
-]
-col_fat = next((c for c in possiveis_colunas_faturamento if c in df.columns), None)
-
+# Coluna de faturamento (agora sempre deve existir, porque o ETL cria)
+col_fat = "Faturamento" if "Faturamento" in df.columns else None
 if col_fat is not None:
     df[col_fat] = pd.to_numeric(df[col_fat], errors="coerce").fillna(0)
 
-# --- Monta séries por período
 serie_venda = vendas_periodo.copy()
 serie_venda["tipo"] = "Venda"
 
@@ -107,7 +208,6 @@ if col_fat is not None and not serie_faturamento.empty and not serie_venda.empty
 else:
     serie_media = pd.DataFrame({"periodo": [], "valor": [], "tipo": []})
 
-# --- Escolhe dataset e KPI conforme "Análise"
 if analise == "Venda":
     serie = serie_venda
     kpi_label = "Vendas (pedidos únicos)"
@@ -117,7 +217,7 @@ if analise == "Venda":
     tooltip_val = alt.Tooltip("valor:Q", title="Vendas", format=",.0f")
 elif analise == "Faturamento":
     if col_fat is None:
-        st.warning("Não encontrei coluna de faturamento (ex.: 'Faturamento' ou 'Valor Total').")
+        st.warning("Não encontrei a coluna 'Faturamento'.")
         st.stop()
     serie = serie_faturamento
     kpi_label = "Faturamento"
@@ -127,7 +227,7 @@ elif analise == "Faturamento":
     tooltip_val = alt.Tooltip("valor:Q", title="Faturamento", format=",.2f")
 else:
     if col_fat is None:
-        st.warning("Não encontrei coluna de faturamento (ex.: 'Faturamento' ou 'Valor Total').")
+        st.warning("Não encontrei a coluna 'Faturamento'.")
         st.stop()
     serie = serie_media
     total_vendas = int(df["Ordem de Compra"].nunique())
@@ -138,7 +238,6 @@ else:
     y_title = "Média por venda"
     tooltip_val = alt.Tooltip("valor:Q", title="Média por venda", format=",.2f")
 
-# KPI principal (box padronizado)
 METRIC_HEIGHT = 120
 st.metric(
     kpi_label,
@@ -147,19 +246,15 @@ st.metric(
     border=True,
     width="stretch",
     height=METRIC_HEIGHT,
-)  # [web:185]
+)
 
-# Gráfico da análise selecionada (linha suave)
 chart_linha = (
     alt.Chart(serie)
     .mark_line(interpolate="monotone")
     .encode(
         x=alt.X("periodo:T", title="Período"),
         y=alt.Y("valor:Q", title=y_title),
-        tooltip=[
-            alt.Tooltip("periodo:T", title="Período"),
-            tooltip_val,
-        ],
+        tooltip=[alt.Tooltip("periodo:T", title="Período"), tooltip_val],
     )
     .properties(height=320)
 )
@@ -170,27 +265,19 @@ chart_pontos = (
     .encode(
         x="periodo:T",
         y="valor:Q",
-        tooltip=[
-            alt.Tooltip("periodo:T", title="Período"),
-            tooltip_val,
-        ],
+        tooltip=[alt.Tooltip("periodo:T", title="Período"), tooltip_val],
     )
 )
 
-st.altair_chart(chart_linha + chart_pontos, use_container_width=True)  # [web:55]
+st.altair_chart(chart_linha + chart_pontos, use_container_width=True)
 
 st.markdown("---")
-
-# ============================================================
-# Restante do dashboard (igual ao que você já tinha)
-# ============================================================
 
 # ---------------------------
 # Gráficos (50% / 50%)
 # ---------------------------
 col1, col2 = st.columns(2)
 
-# Rosquinha: Vendas por Gênero (% + legenda)
 with col1:
     st.subheader("Vendas por Gênero (%)")
 
@@ -203,7 +290,6 @@ with col1:
               .reset_index(name="qtd_vendas")
               .sort_values("qtd_vendas", ascending=False)
         )
-
         total = vendas_genero["qtd_vendas"].sum()
         vendas_genero["pct"] = vendas_genero["qtd_vendas"] / total
         vendas_genero["pct_txt"] = (vendas_genero["pct"] * 100).round(1).astype(str) + "%"
@@ -218,7 +304,9 @@ with col1:
             ],
         )
 
-        labels = alt.Chart(vendas_genero).mark_text(radius=120, size=14, fontWeight="bold").encode(
+        labels = alt.Chart(vendas_genero).mark_text(
+            radius=120, size=14, fontWeight="bold"
+        ).encode(
             theta=alt.Theta("qtd_vendas:Q", stack=True),
             text=alt.Text("pct_txt:N"),
             color=alt.value("white"),
@@ -226,7 +314,6 @@ with col1:
 
         st.altair_chart(donut + labels, use_container_width=True)
 
-# Barras: Estado Civil (com rótulo de dados)
 with col2:
     st.subheader("Vendas por Estado Civil")
 
@@ -259,7 +346,7 @@ with col2:
         st.altair_chart(bars + bar_labels, use_container_width=True)
 
 # ---------------------------
-# Gráfico de Barras Verticais: Vendas por Marca
+# Barras: Vendas por Marca
 # ---------------------------
 st.subheader("Quantidade de vendas por marca")
 
@@ -278,7 +365,7 @@ else:
         y=alt.Y("qtd_vendas:Q", title="Quantidade de vendas"),
         tooltip=[
             alt.Tooltip("Marca:N", title="Marca"),
-            alt.Tooltip("qtd_vendas:Q", title="Qtd. vendas")
+            alt.Tooltip("qtd_vendas:Q", title="Qtd. vendas"),
         ],
     ).properties(height=400)
 
@@ -294,7 +381,7 @@ else:
     st.altair_chart(bars_marca + labels_marca, use_container_width=True)
 
 # ---------------------------
-# Gráfico de Barras Verticais: Vendas por Continente
+# Barras: Vendas por Continente
 # ---------------------------
 st.subheader("Quantidade de vendas por continente")
 
